@@ -1,0 +1,274 @@
+# Blender 4.5 AI Assistant Add-on — Architecture Guide
+
+## Project Structure
+
+```
+blender_ai_assistant/
+├── __init__.py              # bl_info, dep bootstrap, register/unregister
+├── preferences.py           # AddonPreferences: API keys, model, safety flags
+├── operators/
+│   └── __init__.py          # All bpy.types.Operator subclasses + AddonState
+├── panels/
+│   └── __init__.py          # All bpy.types.Panel subclasses (N-panel UI)
+├── utils/
+│   ├── __init__.py
+│   ├── ai_client.py         # HTTP wrapper for Claude / OpenAI / Ollama
+│   ├── sandbox.py           # AST scanner + restricted exec sandbox
+│   └── scene_context.py     # Scene → JSON serialiser
+└── assets/
+    └── example_prompts.py   # Reference AI-generated code snippets
+```
+
+---
+
+## 1. Add-on Architecture
+
+### Registration Flow
+
+```
+Blender startup
+  └─ __init__.register()
+       ├─ preferences.register()     ← always registered (even if deps missing)
+       ├─ operators.register()       ← registers OT classes + bpy.types.Scene props
+       └─ panels.register()          ← registers PT classes in VIEW_3D sidebar
+```
+
+### State Management
+
+Blender operators are **stateless** — they are instantiated fresh for every call.
+Shared mutable state lives in `operators.AddonState`, a plain Python class
+instance (`STATE`) stored at module level.  Blender's property system
+(`bpy.types.Scene.*`) is used only for properties that need to appear in the UI.
+
+### Threading Model
+
+```
+Main Thread (Blender)            Background Thread
+─────────────────────            ────────────────────────────────────────────
+AI_OT_send_prompt.execute()
+  STATE.is_running = True
+  thread.start()          ──────▶  _worker()
+                                     client.chat(history)   # blocks on HTTP
+  return {"FINISHED"}                …response arrives…
+                                     bpy.app.timers.register(_back)
+                          ◀──────
+_back()  (main thread, via timer)
+  STATE.is_running = False
+  update scene properties
+  tag_redraw()
+```
+
+`bpy.app.timers.register(fn, first_interval=0.05)` is the **only** safe way
+to call bpy APIs from a background thread.  All other bpy calls from a
+non-main thread will crash Blender.
+
+---
+
+## 2. External AI Integration
+
+### Claude (Anthropic)
+
+```python
+POST https://api.anthropic.com/v1/messages
+Headers:
+  x-api-key: <your_key>
+  anthropic-version: 2023-06-01
+  content-type: application/json
+Body:
+  {
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 2048,
+    "system": "<system prompt>",
+    "messages": [{"role": "user", "content": "..."}]
+  }
+```
+
+### OpenAI / Compatible
+
+```python
+POST https://api.openai.com/v1/chat/completions
+Headers:
+  Authorization: Bearer <key>
+Body:
+  {
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "..."},
+      {"role": "user",   "content": "..."}
+    ]
+  }
+```
+
+### Ollama (local)
+
+```python
+POST http://localhost:11434/api/chat
+Body:
+  {
+    "model": "llama3",
+    "messages": [...],
+    "stream": false
+  }
+```
+
+### Dependency Installation
+
+Blender ships its own Python with **no pip packages**.
+The add-on bootstraps missing packages on first load:
+
+```python
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", pkg])
+```
+
+Packages are installed to the user site-packages directory
+(`~/.local/lib/python3.11/site-packages/` on Linux/macOS,
+`%APPDATA%\Python\Python311\site-packages` on Windows).
+
+---
+
+## 3. JSON Protocol (AI ↔ Add-on)
+
+The system prompt instructs the AI to return **only** this JSON schema:
+
+```json
+{
+  "action":      "run_code | explain | modify_scene",
+  "code":        "<Python using bpy>",
+  "explanation": "<human-readable summary>",
+  "warnings":    ["<optional caveats>"]
+}
+```
+
+The `_parse_response()` function in `operators/__init__.py` handles:
+- Valid JSON → use structured fields
+- Markdown-fenced JSON (```json ... ```) → strip fences first
+- Plain text fallback → treat as `explain` action
+
+---
+
+## 4. Security Sandbox
+
+### Threat Model
+
+| Threat | Mitigation |
+|---|---|
+| `import os; os.system("rm -rf /")` | AST scan blocks `os` import |
+| `bpy.ops.wm.quit_blender()` | `_BANNED_BPY_OPS` set checked in AST |
+| `__import__("os")` | `__import__` in `_BANNED_ATTR_PATTERNS` |
+| Infinite loop | Thread with `timeout` join |
+| Access to Blender prefs/files | Only `bpy`, `mathutils`, `math` in namespace |
+| `ctypes` / compiled extensions | Blocked by banned imports list |
+
+### What the sandbox CANNOT prevent
+
+- Code that uses `bpy.data` to write to arbitrary file paths
+- Pure CPU exhaustion (no SIGALRM on Windows)
+- Attacks through bpy's own APIs
+
+**Recommendation:** For production, run untrusted code in a separate
+`blender --background` subprocess and pipe results back (see `sandbox.py`
+comments for the pattern).
+
+---
+
+## 5. Local LLM vs Cloud API
+
+| | Cloud (Claude/OpenAI) | Local (Ollama/llama.cpp) |
+|---|---|---|
+| **Quality** | ★★★★★ | ★★★ (depends on model) |
+| **Speed** | 2–10 s (network) | 5–60 s (hardware-dependent) |
+| **Privacy** | Prompts leave machine | Fully local |
+| **Cost** | Per token | Free after hardware |
+| **Setup** | API key only | Install + download model (4–70 GB) |
+| **Blender blocking** | Thread + timer ✓ | Thread + timer ✓ |
+| **Embedding in Blender** | HTTP call only | HTTP to localhost:11434 |
+
+**Verdict:** Embedding an LLM *inside* Blender's process is **not practical**
+because Blender's Python cannot load GPU extensions (llama-cpp-python's
+CUDA/Metal backends) and the memory footprint would dwarf Blender itself.
+Always run the model out-of-process (cloud API or local Ollama/LM Studio
+server) and communicate via HTTP.
+
+---
+
+## 6. Scene Context Format
+
+The add-on can optionally prepend a JSON scene description to every prompt:
+
+```json
+{
+  "scene_name": "Scene",
+  "frame_current": 1,
+  "active_object": "Cube",
+  "selected": ["Cube"],
+  "objects": [
+    {
+      "name": "Cube",
+      "type": "MESH",
+      "location": [0.0, 0.0, 0.0],
+      "mesh": { "vertices": 8, "polygons": 6, "materials": ["Material"] }
+    }
+  ]
+}
+```
+
+This lets the AI reference existing objects by name and avoid conflicts.
+
+---
+
+## 7. Installation
+
+1. Zip the `blender_ai_assistant/` folder.
+2. In Blender: **Edit → Preferences → Add-ons → Install** → select the zip.
+3. Enable the add-on.  On first enable, missing packages are auto-installed.
+4. Set your API key in **Preferences → Add-ons → AI Assistant**.
+5. Open the **N-panel** in the 3D Viewport (press **N**) → **AI Assistant** tab.
+
+---
+
+## 8. Example Workflow
+
+```
+User types: "Create a low-poly mountain range with 5 peaks"
+
+Add-on:
+  1. Prepends scene JSON context
+  2. Sends to Claude via HTTPS
+  3. Claude returns JSON:
+     {
+       "action": "run_code",
+       "code": "import bpy\n...",
+       "explanation": "Creates 5 mountain peaks using subdivided cones..."
+     }
+  4. Panel shows explanation + code preview
+  5. User clicks "▶ Execute"
+  6. Sandbox scans AST → clean
+  7. exec() with restricted builtins + {bpy, mathutils, math}
+  8. Mountains appear in viewport
+```
+
+---
+
+## 9. Extending the Add-on
+
+### Add a new AI provider
+
+1. Add an entry to `preferences.py` → `ai_provider` EnumProperty items.
+2. Add a `_call_<provider>` method in `utils/ai_client.py`.
+3. Handle it in `AIClient.chat()`.
+
+### Streaming responses
+
+Use `requests` with `stream=True` and call `bpy.app.timers.register` on each
+chunk to update `context.scene.ai_response_display` incrementally.
+
+### File import (OBJ / FBX / GLTF)
+
+Have the AI return `{"action": "import_file", "url": "...", "format": "gltf"}`
+and handle it in a dedicated operator that uses `bpy.ops.import_scene.*`.
+
+### Geometry Nodes graph generation
+
+Ask the AI to return node graph descriptions as JSON, then translate each node
+type to `nodes.new(type_string)` calls.  See `assets/example_prompts.py` for
+a working scatter example.
